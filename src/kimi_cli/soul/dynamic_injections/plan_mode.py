@@ -41,6 +41,10 @@ class PlanModeInjectionProvider(DynamicInjectionProvider):
         if not soul.plan_mode:
             self._inject_count = 0
             return []
+        # When a plugin overrides plan mode with its own agent, skip native
+        # read-only reminders so the plugin agent can operate without interference.
+        if soul.plugin_plan_mode_active:
+            return []
 
         plan_path = soul.get_plan_file_path()
         plan_path_str = str(plan_path) if plan_path else None

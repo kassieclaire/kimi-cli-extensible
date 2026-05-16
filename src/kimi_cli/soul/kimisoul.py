@@ -163,6 +163,8 @@ class KimiSoul:
         agent: Agent,
         *,
         context: Context,
+        original_agent_file: Path | None = None,
+        mcp_configs: list[Any] | None = None,
     ):
         """
         Initialize the soul.
@@ -170,6 +172,9 @@ class KimiSoul:
         Args:
             agent (Agent): The agent to run.
             context (Context): The context of the agent.
+            original_agent_file (Path | None): The agent file this soul was originally
+                loaded from. Used for restoring the original agent after plugin plan mode.
+            mcp_configs (list[Any] | None): MCP configs to use when reloading agents.
         """
         self._agent = agent
         self._runtime = agent.runtime
@@ -211,6 +216,11 @@ class KimiSoul:
         self._stop_hook_active: bool = False
         if self.is_root:
             self._runtime.notifications.ack_ids("llm", extract_notification_ids(context.history))
+
+        # Plugin plan mode state
+        self._original_agent_file: Path | None = original_agent_file
+        self._mcp_configs: list[Any] = mcp_configs or []
+        self._plugin_plan_mode_active: bool = False
 
         # Bind plan mode state to tools that support it
         self._bind_plan_mode_tools()
@@ -394,10 +404,41 @@ class KimiSoul:
             self._runtime.session.state.plan_slug = slug
             self._runtime.session.save_state()
 
-    def _set_plan_mode(self, enabled: bool, *, source: Literal["manual", "tool"]) -> bool:
-        """Update plan mode state for either manual or tool-driven toggles."""
+    async def _set_plan_mode(self, enabled: bool, *, source: Literal["manual", "tool"]) -> bool:
+        """Update plan mode state for either manual or tool-driven toggles.
+
+        When a plugin declares a ``plan_mode`` extension, entering plan mode
+        switches the active agent instead of enabling native read-only mode.
+        """
         if enabled == self._plan_mode:
             return self._plan_mode
+
+        # Check for plugin plan mode extension
+        plugin_plan_agent = self._runtime.plugin_plan_mode_agent
+        if plugin_plan_agent is not None and self.is_root:
+            if enabled:
+                # Store original agent file and switch to plan agent
+                if self._original_agent_file is None:
+                    logger.warning(
+                        "Plugin plan mode active but original_agent_file unknown; "
+                        "cannot restore after exit"
+                    )
+                self._plugin_plan_mode_active = True
+                plan_agent_def = self._runtime.labor_market.get_builtin_type(plugin_plan_agent)
+                if plan_agent_def is not None:
+                    await self.reload_agent(plan_agent_def.agent_file)
+                else:
+                    logger.warning(
+                        "Plugin plan_mode agent '{agent}' not found in labor market, "
+                        "falling back to native plan mode",
+                        agent=plugin_plan_agent,
+                    )
+            else:
+                # Switch back to original agent
+                self._plugin_plan_mode_active = False
+                if self._original_agent_file is not None:
+                    await self.reload_agent(self._original_agent_file)
+
         self._plan_mode = enabled
         if enabled:
             self._ensure_plan_session_id()
@@ -441,11 +482,11 @@ class KimiSoul:
         state at call time and rejects if blocked.
         Periodic reminders are handled by the dynamic injection system.
         """
-        return self._set_plan_mode(not self._plan_mode, source="tool")
+        return await self._set_plan_mode(not self._plan_mode, source="tool")
 
     async def toggle_plan_mode_from_manual(self) -> bool:
         """Toggle plan mode from UI/manual entry points (slash command, keybinding)."""
-        return self._set_plan_mode(not self._plan_mode, source="manual")
+        return await self._set_plan_mode(not self._plan_mode, source="manual")
 
     async def set_plan_mode_from_manual(self, enabled: bool) -> bool:
         """Set plan mode to a specific state from UI/manual entry points.
@@ -453,7 +494,7 @@ class KimiSoul:
         Unlike toggle, this accepts the desired state directly, avoiding
         race conditions when the caller already knows the target value.
         """
-        return self._set_plan_mode(enabled, source="manual")
+        return await self._set_plan_mode(enabled, source="manual")
 
     def schedule_plan_activation_reminder(self) -> None:
         """Schedule a plan-mode activation reminder for the next turn.
@@ -502,6 +543,46 @@ class KimiSoul:
     @property
     def runtime(self) -> Runtime:
         return self._runtime
+
+    @property
+    def plugin_plan_mode_active(self) -> bool:
+        """Whether plugin-provided plan mode (agent switching) is currently active."""
+        return self._plugin_plan_mode_active
+
+    async def reload_agent(self, agent_file: Path) -> None:
+        """Hot-swap the active agent mid-session.
+
+        Loads a new agent from *agent_file*, replaces the current agent,
+        rewrites the system prompt in context, and rebuilds slash commands.
+        MCP tools are reloaded if ``mcp_configs`` was provided at soul creation.
+        """
+        from kimi_cli.soul.agent import load_agent
+
+        new_agent = await load_agent(
+            agent_file,
+            self._runtime,
+            mcp_configs=self._mcp_configs,
+            start_mcp_loading=False,
+        )
+        self._agent = new_agent
+
+        # Update checkpoint behavior based on new toolset
+        for tool in new_agent.toolset.tools:
+            if tool.name == SendDMail_NAME:
+                self._checkpoint_with_user_message = True
+                break
+        else:
+            self._checkpoint_with_user_message = False
+
+        # Rewrite system prompt in context
+        await self._context.write_system_prompt(new_agent.system_prompt)
+
+        # Rebind plan mode tools to new agent's toolset
+        self._bind_plan_mode_tools()
+
+        # Rebuild slash commands (some may be agent-specific)
+        self._slash_commands = self._build_slash_commands()
+        self._slash_command_map = self._index_slash_commands(self._slash_commands)
 
     @property
     def context(self) -> Context:

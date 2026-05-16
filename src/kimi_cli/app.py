@@ -309,7 +309,12 @@ class KimiCLI:
         else:
             await context.write_system_prompt(agent.system_prompt)
 
-        soul = KimiSoul(agent, context=context)
+        soul = KimiSoul(
+            agent,
+            context=context,
+            original_agent_file=agent_file,
+            mcp_configs=mcp_configs or [],
+        )
 
         # Activate plan mode if requested (for new sessions or --plan flag)
         if plan_mode and not soul.plan_mode:

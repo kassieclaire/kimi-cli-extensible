@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -31,6 +31,7 @@ from kimi_cli.skill import (
 from kimi_cli.soul.approval import Approval, ApprovalState
 from kimi_cli.soul.denwarenji import DenwaRenji
 from kimi_cli.soul.toolset import KimiToolset
+from kimi_cli.plugin import PluginPlanModeExtension
 from kimi_cli.subagents.models import AgentTypeDefinition, ToolPolicy
 from kimi_cli.subagents.registry import LaborMarket
 from kimi_cli.subagents.store import SubagentStore
@@ -197,6 +198,12 @@ class Runtime:
     hook_engine: Any = None
     """HookEngine instance, set by KimiCLI after soul creation."""
 
+    plugin_extensions: dict[str, Any] = field(default_factory=dict)
+    """Raw extension configs from all loaded plugins, keyed by plugin name."""
+
+    plugin_plan_mode_agent: str | None = None
+    """Agent ID to switch to when plan mode is toggled by a plugin extension."""
+
     def __post_init__(self) -> None:
         if self.subagent_store is None:
             self.subagent_store = SubagentStore(self.session)
@@ -207,6 +214,37 @@ class Runtime:
         self.approval_runtime.bind_root_wire_hub(self.root_wire_hub)
         self.approval.set_runtime(self.approval_runtime)
         self.background_tasks.bind_runtime(self)
+
+    @staticmethod
+    def _load_plugin_extensions() -> tuple[dict[str, Any], str | None]:
+        """Scan installed plugins and return their extension configs.
+
+        Returns a tuple of (extensions_dict, plan_mode_agent_id).
+        The plan_mode_agent_id is the first plan_mode extension found,
+        or None if no plugin declares one.
+        """
+        from kimi_cli.plugin import PLUGIN_JSON, PluginError, parse_plugin_json
+        from kimi_cli.plugin.manager import get_plugins_dir
+
+        plugins_dir = get_plugins_dir()
+        if not plugins_dir.is_dir():
+            return {}, None
+
+        extensions: dict[str, Any] = {}
+        plan_mode_agent: str | None = None
+        for child in sorted(plugins_dir.iterdir()):
+            plugin_json = child / PLUGIN_JSON
+            if not child.is_dir() or not plugin_json.is_file():
+                continue
+            try:
+                spec = parse_plugin_json(plugin_json)
+            except PluginError:
+                continue
+            if spec.extensions is not None:
+                extensions[spec.name] = spec.extensions.model_dump(exclude_none=True)
+                if plan_mode_agent is None and spec.extensions.plan_mode is not None:
+                    plan_mode_agent = spec.extensions.plan_mode.agent
+        return extensions, plan_mode_agent
 
     @staticmethod
     async def create(
@@ -298,6 +336,8 @@ class Runtime:
             config.notifications,
         )
 
+        plugin_extensions, plugin_plan_mode_agent = Runtime._load_plugin_extensions()
+
         return Runtime(
             config=config,
             oauth=oauth,
@@ -334,6 +374,8 @@ class Runtime:
             approval_runtime=ApprovalRuntime(),
             root_wire_hub=RootWireHub(),
             role="root",
+            plugin_extensions=plugin_extensions,
+            plugin_plan_mode_agent=plugin_plan_mode_agent,
         )
 
     def copy_for_subagent(
@@ -366,6 +408,8 @@ class Runtime:
             subagent_id=agent_id,
             subagent_type=subagent_type,
             role="subagent",
+            plugin_extensions=self.plugin_extensions,
+            plugin_plan_mode_agent=self.plugin_plan_mode_agent,
         )
 
 
@@ -378,6 +422,81 @@ class Agent:
     toolset: Toolset
     runtime: Runtime
     """Each agent has its own runtime, which should be derived from its main agent."""
+
+
+def _register_plugin_agents(runtime: Runtime) -> None:
+    """Scan installed plugins for ``agents/<name>/agent.yaml`` definitions
+    and register them in the labor market.
+
+    Agents are registered with their bare name (e.g., ``muse``) unless a name
+    conflict exists, in which case they are namespaced as
+    ``<plugin_name>:<agent_name>``.
+    """
+    from kimi_cli.plugin import PLUGIN_JSON, PluginError, parse_plugin_json
+    from kimi_cli.plugin.manager import get_plugins_dir
+
+    plugins_dir = get_plugins_dir()
+    if not plugins_dir.is_dir():
+        return
+
+    for child in sorted(plugins_dir.iterdir()):
+        plugin_json = child / PLUGIN_JSON
+        if not child.is_dir() or not plugin_json.is_file():
+            continue
+        try:
+            spec = parse_plugin_json(plugin_json)
+        except PluginError:
+            continue
+
+        agents_dir = child / "agents"
+        if not agents_dir.is_dir():
+            continue
+
+        for agent_dir in sorted(agents_dir.iterdir()):
+            agent_yaml = agent_dir / "agent.yaml"
+            if not agent_dir.is_dir() or not agent_yaml.is_file():
+                continue
+            try:
+                builtin_spec = load_agent_spec(agent_yaml)
+            except Exception:
+                logger.warning(
+                    "Skipping invalid plugin agent: {path}", path=agent_yaml
+                )
+                continue
+
+            agent_name = agent_dir.name
+            # If bare name already taken, namespace it
+            effective_name = agent_name
+            if runtime.labor_market.get_builtin_type(effective_name) is not None:
+                effective_name = f"{spec.name}:{agent_name}"
+                if runtime.labor_market.get_builtin_type(effective_name) is not None:
+                    logger.warning(
+                        "Plugin agent '{name}' from '{plugin}' conflicts with existing type, skipping",
+                        name=effective_name,
+                        plugin=spec.name,
+                    )
+                    continue
+
+            tool_policy = (
+                ToolPolicy(mode="allowlist", tools=tuple(builtin_spec.allowed_tools))
+                if builtin_spec.allowed_tools is not None
+                else ToolPolicy(mode="inherit")
+            )
+            runtime.labor_market.add_builtin_type(
+                AgentTypeDefinition(
+                    name=effective_name,
+                    description=builtin_spec.when_to_use or f"Plugin agent: {agent_name}",
+                    agent_file=agent_yaml,
+                    when_to_use=builtin_spec.when_to_use,
+                    default_model=builtin_spec.model,
+                    tool_policy=tool_policy,
+                )
+            )
+            logger.info(
+                "Registered plugin agent: {name} (from {plugin})",
+                name=effective_name,
+                plugin=spec.name,
+            )
 
 
 async def load_agent(
@@ -430,6 +549,9 @@ async def load_agent(
                 tool_policy=tool_policy,
             )
         )
+
+    # Register plugin-provided agents in the labor market.
+    _register_plugin_agents(runtime)
 
     toolset = KimiToolset()
     tool_deps = {

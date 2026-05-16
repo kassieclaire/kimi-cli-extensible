@@ -27,6 +27,27 @@ class PluginToolSpec(BaseModel):
     parameters: dict[str, object] = Field(default_factory=dict)
 
 
+class PluginPlanModeExtension(BaseModel):
+    """Extension that overrides native plan mode behavior.
+
+    When present, plan mode triggers (``/plan``, ``Shift-Tab``, ``--plan``)
+    switch the active agent instead of toggling the native read-only plan mode.
+    """
+
+    type: str = "agent_switch"
+    """Strategy for plan mode. Currently only ``agent_switch`` is supported."""
+
+    agent: str
+    """The agent ID to switch to when plan mode is activated."""
+
+
+class PluginExtension(BaseModel):
+    """Plugin extension declarations that alter kimi-cli core behavior."""
+
+    plan_mode: PluginPlanModeExtension | None = None
+    """Override native plan mode with a custom agent switch."""
+
+
 class PluginSpec(BaseModel):
     """Parsed representation of a plugin.json file."""
 
@@ -39,6 +60,7 @@ class PluginSpec(BaseModel):
     inject: dict[str, str] = Field(default_factory=dict)
     tools: list[PluginToolSpec] = Field(default_factory=list)  # pyright: ignore[reportUnknownVariableType]
     runtime: PluginRuntime | None = None
+    extensions: PluginExtension | None = None
 
 
 PLUGIN_JSON = "plugin.json"

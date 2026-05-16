@@ -7,18 +7,34 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from kosong.tooling import CallableTool, ToolError, ToolOk
+from kosong.tooling import CallableTool, ToolError, ToolOk, ToolReturnValue
 from kosong.tooling.error import ToolRuntimeError
 from loguru import logger
 
 from kimi_cli.plugin import PluginToolSpec
+from kimi_cli.tools.display import (
+    BackgroundTaskDisplayBlock,
+    DiffDisplayBlock,
+    ShellDisplayBlock,
+    TodoDisplayBlock,
+)
 from kimi_cli.tools.utils import ToolRejectedError
 from kimi_cli.utils.subprocess_env import get_clean_env
-from kimi_cli.wire.types import ToolReturnValue
+from kimi_cli.wire.types import ToolReturnValue as WireToolReturnValue
 
 if TYPE_CHECKING:
     from kimi_cli.config import Config
     from kimi_cli.soul.approval import Approval
+
+
+# Display block types that plugins are allowed to return.
+# Unknown types are silently dropped for security.
+_ALLOWED_PLUGIN_DISPLAY_BLOCKS: dict[str, type] = {
+    "todo": TodoDisplayBlock,
+    "diff": DiffDisplayBlock,
+    "shell": ShellDisplayBlock,
+    "background_task": BackgroundTaskDisplayBlock,
+}
 
 
 def _get_host_values(config: Config) -> dict[str, str]:
@@ -41,6 +57,20 @@ class PluginTool(CallableTool):
     stdout is captured as the tool result.
     Host credentials are injected as environment variables at runtime
     (not baked into config files) to handle OAuth token refresh.
+
+    Plugin tools may return either:
+    - Plain text (legacy): wrapped in ``ToolOk``.
+    - JSON (extended): parsed into a full ``ToolReturnValue`` with optional
+      ``display`` blocks (e.g., ``TodoDisplayBlock``). The JSON schema is::
+
+        {
+          "output": "string or list[ContentPart]",
+          "message": "string (optional, defaults to output)",
+          "display": [
+            {"type": "todo", "items": [...]},
+            {"type": "diff", "path": "...", ...}
+          ]
+        }
     """
 
     def __init__(
@@ -127,7 +157,66 @@ class PluginTool(CallableTool):
         if err_output:
             logger.debug("Plugin tool {name} stderr: {err}", name=self.name, err=err_output)
 
+        # Try to parse as extended JSON response (with display blocks)
+        parsed = self._try_parse_json_response(output)
+        if parsed is not None:
+            return parsed
+
+        # Fallback: plain text legacy response
         return ToolOk(output=output)
+
+    def _try_parse_json_response(self, text: str) -> ToolReturnValue | None:
+        """Attempt to parse plugin stdout as a structured JSON response.
+
+        Returns ``None`` if the text is not valid JSON or does not contain
+        the required ``output`` field, signalling the caller to fall back to
+        plain text wrapping.
+        """
+        if not text.startswith("{"):
+            return None
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+
+        if not isinstance(data, dict) or "output" not in data:
+            return None
+
+        output = data["output"]
+        message = data.get("message", "")
+        if not message:
+            message = output if isinstance(output, str) else ""
+
+        display_blocks: list[Any] = []
+        raw_display = data.get("display")
+        if isinstance(raw_display, list):
+            for block_data in raw_display:
+                if not isinstance(block_data, dict):
+                    continue
+                block_type = block_data.get("type")
+                block_cls = _ALLOWED_PLUGIN_DISPLAY_BLOCKS.get(block_type)
+                if block_cls is None:
+                    logger.warning(
+                        "Plugin tool '{name}' returned unknown display block type '{type}', skipping",
+                        name=self.name,
+                        type=block_type,
+                    )
+                    continue
+                try:
+                    display_blocks.append(block_cls(**block_data))
+                except Exception:
+                    logger.warning(
+                        "Plugin tool '{name}' returned invalid {type} display block, skipping",
+                        name=self.name,
+                        type=block_type,
+                    )
+
+        return WireToolReturnValue(
+            is_error=False,
+            output=output,
+            message=message,
+            display=display_blocks,
+        )
 
 
 def load_plugin_tools(
