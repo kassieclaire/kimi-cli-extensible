@@ -96,7 +96,7 @@ async def test_kimi_cli_create_reports_startup_phases(session, config, monkeypat
     monkeypatch.setattr(app_module, "Context", lambda _path: fake_context)
 
     class _FakeSoul:
-        def __init__(self, agent, context):
+        def __init__(self, agent, context, **kwargs):
             pass
 
         def set_hook_engine(self, engine):
@@ -161,7 +161,7 @@ async def test_kimi_cli_create_cleans_stale_running_foreground_subagents(
     monkeypatch.setattr(app_module, "Context", lambda _path: fake_context)
 
     class _FakeSoul:
-        def __init__(self, agent, context):
+        def __init__(self, agent, context, **kwargs):
             pass
 
         def set_hook_engine(self, engine):

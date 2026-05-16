@@ -27,7 +27,7 @@ def _patch_create_deps(monkeypatch, *, session_plan_mode: bool = False):
 
         instances: list[FakeSoul] = []
 
-        def __init__(self, agent, context):
+        def __init__(self, agent, context, **kwargs):
             self.plan_mode = session_plan_mode
             self._set_plan_mode_calls: list[tuple[bool, str]] = []
             self._schedule_reminder_called = False

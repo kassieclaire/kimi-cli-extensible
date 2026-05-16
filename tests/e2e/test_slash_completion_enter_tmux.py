@@ -13,9 +13,22 @@ import pytest
 from tests.e2e.shell_pty_helpers import make_home_dir, make_work_dir, write_scripted_config
 from tests_e2e.wire_helpers import repo_root
 
+def _tmux_works() -> bool:
+    if sys.platform == "win32" or shutil.which("tmux") is None:
+        return False
+    try:
+        session = f"test-{uuid.uuid4().hex[:8]}"
+        subprocess.run(["tmux", "new-session", "-d", "-s", session], check=True, capture_output=True)
+        subprocess.run(["tmux", "capture-pane", "-pt", f"{session}:0.0"], check=True, capture_output=True)
+        subprocess.run(["tmux", "kill-session", "-t", session], check=False, capture_output=True)
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
 pytestmark = pytest.mark.skipif(
-    sys.platform == "win32" or shutil.which("tmux") is None,
-    reason="tmux E2E tests require tmux on a Unix-like platform.",
+    not _tmux_works(),
+    reason="tmux E2E tests require a working tmux environment.",
 )
 
 

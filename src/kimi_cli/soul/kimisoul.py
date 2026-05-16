@@ -404,41 +404,16 @@ class KimiSoul:
             self._runtime.session.state.plan_slug = slug
             self._runtime.session.save_state()
 
-    async def _set_plan_mode(self, enabled: bool, *, source: Literal["manual", "tool"]) -> bool:
+    def _set_plan_mode(self, enabled: bool, *, source: Literal["manual", "tool"]) -> bool:
         """Update plan mode state for either manual or tool-driven toggles.
 
-        When a plugin declares a ``plan_mode`` extension, entering plan mode
-        switches the active agent instead of enabling native read-only mode.
+        This method is synchronous so that existing tests and internal callers
+        can use it directly. The async agent-switching logic for plugin plan
+        mode is handled by :meth:`_apply_plugin_plan_mode`, which the public
+        async toggle methods call afterwards.
         """
         if enabled == self._plan_mode:
             return self._plan_mode
-
-        # Check for plugin plan mode extension
-        plugin_plan_agent = self._runtime.plugin_plan_mode_agent
-        if plugin_plan_agent is not None and self.is_root:
-            if enabled:
-                # Store original agent file and switch to plan agent
-                if self._original_agent_file is None:
-                    logger.warning(
-                        "Plugin plan mode active but original_agent_file unknown; "
-                        "cannot restore after exit"
-                    )
-                self._plugin_plan_mode_active = True
-                plan_agent_def = self._runtime.labor_market.get_builtin_type(plugin_plan_agent)
-                if plan_agent_def is not None:
-                    await self.reload_agent(plan_agent_def.agent_file)
-                else:
-                    logger.warning(
-                        "Plugin plan_mode agent '{agent}' not found in labor market, "
-                        "falling back to native plan mode",
-                        agent=plugin_plan_agent,
-                    )
-            else:
-                # Switch back to original agent
-                self._plugin_plan_mode_active = False
-                if self._original_agent_file is not None:
-                    await self.reload_agent(self._original_agent_file)
-
         self._plan_mode = enabled
         if enabled:
             self._ensure_plan_session_id()
@@ -452,6 +427,36 @@ class KimiSoul:
         self._runtime.session.state.plan_mode = self._plan_mode
         self._runtime.session.save_state()
         return self._plan_mode
+
+    async def _apply_plugin_plan_mode(self, enabled: bool) -> None:
+        """Apply agent switching when a plugin overrides plan mode.
+
+        Called by the public async toggle methods *after* :meth:`_set_plan_mode`
+        has updated the synchronous state.
+        """
+        plugin_plan_agent = self._runtime.plugin_plan_mode_agent
+        if plugin_plan_agent is None or not self.is_root:
+            return
+        if enabled:
+            if self._original_agent_file is None:
+                logger.warning(
+                    "Plugin plan mode active but original_agent_file unknown; "
+                    "cannot restore after exit"
+                )
+            self._plugin_plan_mode_active = True
+            plan_agent_def = self._runtime.labor_market.get_builtin_type(plugin_plan_agent)
+            if plan_agent_def is not None:
+                await self.reload_agent(plan_agent_def.agent_file)
+            else:
+                logger.warning(
+                    "Plugin plan_mode agent '{agent}' not found in labor market, "
+                    "falling back to native plan mode",
+                    agent=plugin_plan_agent,
+                )
+        else:
+            self._plugin_plan_mode_active = False
+            if self._original_agent_file is not None:
+                await self.reload_agent(self._original_agent_file)
 
     def get_plan_file_path(self) -> Path | None:
         """Get the plan file path for the current session."""
@@ -482,11 +487,17 @@ class KimiSoul:
         state at call time and rejects if blocked.
         Periodic reminders are handled by the dynamic injection system.
         """
-        return await self._set_plan_mode(not self._plan_mode, source="tool")
+        new_state = not self._plan_mode
+        self._set_plan_mode(new_state, source="tool")
+        await self._apply_plugin_plan_mode(new_state)
+        return self._plan_mode
 
     async def toggle_plan_mode_from_manual(self) -> bool:
         """Toggle plan mode from UI/manual entry points (slash command, keybinding)."""
-        return await self._set_plan_mode(not self._plan_mode, source="manual")
+        new_state = not self._plan_mode
+        self._set_plan_mode(new_state, source="manual")
+        await self._apply_plugin_plan_mode(new_state)
+        return self._plan_mode
 
     async def set_plan_mode_from_manual(self, enabled: bool) -> bool:
         """Set plan mode to a specific state from UI/manual entry points.
@@ -494,7 +505,9 @@ class KimiSoul:
         Unlike toggle, this accepts the desired state directly, avoiding
         race conditions when the caller already knows the target value.
         """
-        return await self._set_plan_mode(enabled, source="manual")
+        self._set_plan_mode(enabled, source="manual")
+        await self._apply_plugin_plan_mode(enabled)
+        return self._plan_mode
 
     def schedule_plan_activation_reminder(self) -> None:
         """Schedule a plan-mode activation reminder for the next turn.

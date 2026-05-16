@@ -21,7 +21,14 @@ def _plain_text(segments: list[Segment]) -> str:
 
 
 def _filled_bar_segments(segments: list[Segment]) -> list[Segment]:
-    return [segment for segment in segments if "━" in segment.text]
+    # Only count segments that are actually filled (non-grey colors).
+    # The rich library renders both the filled portion and the empty
+    # background with "━" characters; we only want the filled ones.
+    return [
+        segment
+        for segment in segments
+        if "━" in segment.text and "grey" not in str(segment.style).lower()
+    ]
 
 
 @pytest.mark.parametrize(

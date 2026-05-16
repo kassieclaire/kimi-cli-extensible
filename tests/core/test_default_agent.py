@@ -12,7 +12,10 @@ from kimi_cli.soul.agent import Runtime, load_agent
 
 
 @pytest.mark.skipif(platform.system() == "Windows", reason="Skipping test on Windows")
-async def test_default_agent(runtime: Runtime):
+async def test_default_agent(runtime: Runtime, monkeypatch: pytest.MonkeyPatch, tmp_path):
+    # Isolate from any real plugins installed on the system
+    from kimi_cli.plugin import manager as plugin_manager_module
+    monkeypatch.setattr(plugin_manager_module, "get_plugins_dir", lambda: tmp_path / "no_plugins")
     agent = await load_agent(DEFAULT_AGENT_FILE, runtime, mcp_configs=[])
     assert agent.system_prompt.replace(
         f"{runtime.builtin_args.KIMI_WORK_DIR}", "/path/to/work/dir"
@@ -248,7 +251,10 @@ At any time, you should be HELPFUL, CONCISE, and ACCURATE. Be thorough in your a
 
 
 @pytest.mark.skipif(platform.system() == "Windows", reason="Skipping test on Windows")
-async def test_default_agent_background_bash_guardrails(runtime: Runtime):
+async def test_default_agent_background_bash_guardrails(runtime: Runtime, monkeypatch: pytest.MonkeyPatch, tmp_path):
+    # Isolate from any real plugins installed on the system
+    from kimi_cli.plugin import manager as plugin_manager_module
+    monkeypatch.setattr(plugin_manager_module, "get_plugins_dir", lambda: tmp_path / "no_plugins")
     agent = await load_agent(DEFAULT_AGENT_FILE, runtime, mcp_configs=[])
 
     assert "the only task-management slash command is `/task`" in agent.system_prompt
